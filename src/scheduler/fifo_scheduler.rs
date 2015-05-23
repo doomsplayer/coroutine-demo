@@ -1,3 +1,24 @@
+// The MIT License (MIT)
+
+// Copyright (c) 2015 Rustcc Developers
+
+// Permission is hereby granted, free of charge, to any person obtaining a copy of
+// this software and associated documentation files (the "Software"), to deal in
+// the Software without restriction, including without limitation the rights to
+// use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+// the Software, and to permit persons to whom the Software is furnished to do so,
+// subject to the following conditions:
+
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+// FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+// IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+// CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 use std::thread;
 use std::collections::VecDeque;
 use std::convert::From;
@@ -58,12 +79,14 @@ impl Scheduler {
         }
     }
 
+    /// get current thread's scheduler
     pub fn current() -> &'static mut Scheduler {
         SCHEDULER.with(|s| unsafe {
             &mut *s.get()
         })
     }
 
+    /// spawn a coroutine as you need
     pub fn spawn<F>(f: F) where F: FnOnce() + Send + 'static {
 
         let coro = spawn(f);
@@ -74,15 +97,7 @@ impl Scheduler {
         Coroutine::sched();
     }
 
-    pub fn ready(&mut self, work: Handle) {
-        if self.private_work.is_empty() && self.private_work.len() < MAX_PRIVATE_WORK_NUM {
-            self.public_work_queue.push(work);
-        } else {
-            self.private_work.push_back(work);
-        }
-    }
-
-    // this is the start method
+    /// this is the starting method
     pub fn run<F>(f: F, threads: usize) where F: FnOnce() + Send + 'static {
 
         assert!(threads >= 1, "Threads must >= 1");
@@ -91,43 +106,47 @@ impl Scheduler {
         }
 
         // Start worker threads first
-        let counter = Arc::new(AtomicUsize::new(0));
-        for tid in 0..threads - 1 {
-            let counter = counter.clone();
-            thread::Builder::new().name(format!("Thread {}", tid)).spawn(move|| {
-                let current = Scheduler::current();
-                counter.fetch_add(1, Ordering::SeqCst);
-                current.schedule();
-            }).unwrap();
-        }
+        start_sub_threads(threads);
 
-        while counter.load(Ordering::SeqCst) != threads - 1 {}
-
-        Scheduler::spawn(|| {
-            struct Guard;
-
-            // Send Shutdown to all schedulers
-            impl Drop for Guard {
-                fn drop(&mut self) {
-                    let guard = match schedulers().lock() {
-                        Ok(g) => g,
-                        Err(poisoned) => poisoned.into_inner()
-                    };
-
-                    for &(ref chan, _) in guard.iter() {
-                        let _ = chan.send(SchedMessage::Shutdown);
-                    }
-                }
-            }
-
-            let _guard = Guard;
-
-            f();
-        });
+        Scheduler::spawn(move|| start_main(f));
 
         Scheduler::current().schedule();
 
+        // main coroutine is exit
         SCHEDULER_HAS_STARTED.store(false, Ordering::SeqCst);
+    }
+
+    // no yield allowed here because scheduler's parent is pointing to it self
+    // so that yielding would hatch a duplicated new scheduler coroutine and there will be
+    // two scheduler coroutines in one thread eventually, which makes no sense.
+    fn schedule(&mut self) {
+        while self.recv_msg() {
+            self.run_eventloop_once();
+            
+            debug!("Trying to resume all ready coroutines: {:?}", thread::current().name());
+            
+            while self.run_one_work_in_private_queue() && !self.has_io_waiting_task() {}
+            if self.has_io_waiting_task() { continue; }
+            
+            while self.run_one_work_in_public_queue() && !self.has_io_waiting_task() {}
+            if self.has_io_waiting_task() { continue; }
+            
+            let stolen_works = self.steal_works();
+            let has_stolen = stolen_works.len() != 0;
+            
+            for work in stolen_works.into_iter() { self.ready(work); }
+            
+            if !has_stolen { thread::sleep_ms(100); }
+        }
+    }
+
+    // when a coroutine is ready to be schedule, call me
+    pub fn ready(&mut self, work: Handle) {
+        if self.private_work.is_empty() && self.private_work.len() < MAX_PRIVATE_WORK_NUM {
+            self.public_work_queue.push(work);
+        } else {
+            self.private_work.push_back(work);
+        }
     }
 
     #[inline]
@@ -194,6 +213,7 @@ impl Scheduler {
         }
     }
 
+    // return true if it really resume a coroutine
     #[inline]
     fn run_one_work_in_private_queue(&mut self) -> bool {
         if let Some(work) = self.private_work.pop_front() {
@@ -204,6 +224,7 @@ impl Scheduler {
         }
     }
 
+    // return true if it realy resume a coroutine 
     #[inline]
     fn run_one_work_in_public_queue(&mut self) -> bool {
         if let Stolen::Data(work) = self.public_work_stealer.steal() {  // FIFO Scheduler
@@ -228,39 +249,44 @@ impl Scheduler {
             }).collect()
     }
 
-    // no yield allowed here because scheduler's parent is pointing to it self
-    // so that yielding would hatch a duplicated new scheduler coroutine and there will be
-    // two scheduler coroutines in one thread eventually, which makes no sense.
-    fn schedule(&mut self) {
-        while self.recv_msg() {
-            self.run_eventloop_once();
-            
-            debug!("Trying to resume all ready coroutines: {:?}", thread::current().name());
-            
-            // Run all ready coroutines
-            // while self.run_one_work_in_public_queue() {}
-            
-            while self.run_one_work_in_private_queue() {}
-
-            if self.run_one_work_in_public_queue() {
-                continue;
-            }
-            
-            if !self.eventloop_handler.slabs.is_empty() {
-                debug!("no need for steal or slab is empty");
-                continue;
-            }
-
-            let stolen_works = self.steal_works();
-            let has_stolen = stolen_works.len() != 0;
-            for work in stolen_works.into_iter() {
-                self.resume_coroutine(work);
-            }
-            if !has_stolen {
-                thread::sleep_ms(100);
-            }
-        }
+    #[inline]
+    fn has_io_waiting_task(&self) -> bool {
+        !self.eventloop_handler.slabs.is_empty()
     }
 }
 
+fn start_main<F>(f: F) where F: FnOnce() + Send + 'static {
+    struct Guard;
+    
+    // Send Shutdown to all schedulers
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let guard = match schedulers().lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner()
+            };
+            
+            for &(ref chan, _) in guard.iter() {
+                let _ = chan.send(SchedMessage::Shutdown);
+            }
+        }
+    }
+    
+    let _guard = Guard;
+    
+    f();
+}
+
+fn start_sub_threads(threads: usize) {
+    let counter = Arc::new(AtomicUsize::new(0));
+    for tid in 0..threads - 1 {
+        let counter = counter.clone();
+        thread::Builder::new().name(format!("Thread {}", tid)).spawn(move|| {
+            let current = Scheduler::current();
+            counter.fetch_add(1, Ordering::SeqCst);
+            current.schedule();
+        }).unwrap();
+    }
+    while counter.load(Ordering::SeqCst) != threads - 1 {}
+}
 include!("scheduler_wait_event.rs");
